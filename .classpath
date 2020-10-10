@@ -5,5 +5,7 @@
 	<classpathentry kind="lib" path="jgrapht-bundle-1.3.0.jar"/>
 	<classpathentry kind="lib" path="jgrapht-io-1.3.0.jar"/>
 	<classpathentry kind="lib" path="jgrapht-core-1.3.0.jar"/>
+	<classpathentry kind="lib" path="C:/Users/Kida/eclipse-workspace/NodeVisualizer/gs-core-1.3.jar"/>
+	<classpathentry kind="lib" path="C:/Users/Kida/eclipse-workspace/NodeVisualizer/gs-ui-1.3.jar"/>
 	<classpathentry kind="output" path="bin"/>
 </classpath>

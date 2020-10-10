@@ -13,6 +13,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -33,9 +34,23 @@ import org.jgrapht.io.GraphExporter;
 
 public class ParseFlowGraph {
 
+  private static final int MAX_LABEL_LENGTH = 100;
+
   private static final Logger LOGGER = Logger.getLogger("ParseFlowGraph");
 
   private static final String DOT_EXE = "D:\\PreyFiles\\graphviz-2.38\\release\\bin\\dot.exe";
+  
+  private static final String HEADER_PATTERN = "<([A-Za-z]*?) ";
+  private static final String KEY_PATTERN = "([A-Za-z_]*?)=\"([A-Za-z0-9@&;,-:_/ ]*?)\"";
+  
+  private static final BigInteger TWO_POWER_64 = BigInteger.ONE.shiftLeft(64);
+  
+  private static final String LOCATIONS_FILE = "Ark\\Campaign\\Locations.xml";
+  private static final String OBJECTIVES_DIR = "Ark\\Campaign\\Objectives";
+  private static final String CONNECTIVITY_FILE = "Ark\\Campaign\\StationAccessLibrary.xml";
+  private static final String GAME_METRICS_FILE = "Ark\\Player\\GameMetrics.xml";
+  private static final String REMOTE_EVENTS_FILE = "Ark\\RemoteEventLibrary.xml";
+  private static final String GAME_TOKENS_FILE = "Libs\\GameTokens\\GT_Global.xml";
 
   private File sourceDir;
   private File outDir;
@@ -43,15 +58,21 @@ public class ParseFlowGraph {
   private HashMap<String, String> gameMetricIds;
   private HashMap<String, String> remoteEvents;
   private HashMap<String, String> conversations;
+  private HashMap<String, String> connectivity;
   private HashMap<String, String> objectives;
   private HashMap<String, String> tasks;
   private HashMap<String, String> descriptions;
   private HashMap<String, String> clues;
   private HashMap<String, String> locationIds;
 
-  private HashMap<String, FlowGraphNode> nodes;
+  
   private List<String> unhandledClasses;
 
+  /**
+   * Describes a single node of the flowgraph.
+   * @author Kida
+   *
+   */
   private class FlowGraphNode {
     String id;
     String name;
@@ -94,12 +115,21 @@ public class ParseFlowGraph {
     }
   }
 
+  /**
+   * Describes an edge for the flowgraph.
+   * @author Kida
+   *
+   */
   private class FlowGraphEdge extends DefaultEdge {
     private static final long serialVersionUID = 1L;
     String portIn;
     String portOut;
+    String nodeIn;
+    String nodeOut;
 
-    public FlowGraphEdge(String portIn, String portOut) {
+    public FlowGraphEdge(String nodeIn, String nodeOut, String portIn, String portOut) {
+      this.nodeIn = nodeIn;
+      this.nodeOut = nodeOut;
       this.portIn = portIn;
       this.portOut = portOut;
     }
@@ -111,29 +141,48 @@ public class ParseFlowGraph {
 
   }
 
+  /**
+   * Prepare for parsing flowgraph data
+   * @param sourceDir
+   * @param outDir
+   */
   public ParseFlowGraph(File sourceDir, File outDir) {
     this.sourceDir = sourceDir;
     this.outDir = outDir;
+    
+    // Initialize dictionaries
     gameTokenIds = getGameTokenIds();
     gameMetricIds = getGameMetricIds();
     getObjectives();
     getRemoteEvents();
     parseLocationIds();
+    getConnectivity();
     unhandledClasses = new ArrayList<String>();
   }
 
+  /**
+   * Parses an individual flowgraph file and exports to the out directory.
+   * @param xml File to parse.
+   * @throws IOException
+   * @throws InterruptedException
+   * @throws ExportException
+   */
   public void parse(File xml) throws IOException, InterruptedException, ExportException {
     LOGGER.info("Processing file " + xml.getName());
     if (!xml.exists()) {
       xml.createNewFile();
     }
-    Graph<FlowGraphNode, FlowGraphEdge> graph = new DirectedPseudograph<>(FlowGraphEdge.class);
-    nodes = new HashMap<String, FlowGraphNode>();
+    
+    // Map of node ID to node object.
+    HashMap<String, FlowGraphNode> nodes = new HashMap<String, FlowGraphNode>();
+    // List of edges.
+    List<FlowGraphEdge> edges = new LinkedList<FlowGraphEdge>();
 
     try (BufferedReader r = new BufferedReader(new FileReader(xml.getCanonicalPath()));) {
       String line = r.readLine();
       String lastEntityName = "";
       while (line != null) {
+        // Keep track of the last read entity, if we are looking at a level file.
         if (line.contains("<Entity")) {
           HashMap<String, String> entityKeys = getKeysFromLine(line);
           lastEntityName = entityKeys.get("name");
@@ -156,22 +205,43 @@ public class ParseFlowGraph {
           FlowGraphNode node = new FlowGraphNode(keys.get("id"), keys.get("name"), keys.get("class"),
               Float.parseFloat(coords[0]), Float.parseFloat(coords[1]), Float.parseFloat(coords[2]), inputKeys);
           nodes.put(keys.get("id"), node);
-
-          graph.addVertex(node);
         } else if (line.contains("<Edge ")) {
           HashMap<String, String> keys = getKeysFromLine(line);
-          FlowGraphEdge edge = new FlowGraphEdge(keys.get("portin"), keys.get("portout"));
-          graph.addEdge(nodes.get(keys.get("nodeout")), nodes.get(keys.get("nodein")), edge);
-        } else if (line.contains("</FlowGraph>") && lastEntityName != null && !lastEntityName.equals("")) {
+          FlowGraphEdge edge = new FlowGraphEdge(keys.get("nodein"), keys.get("nodeout"), keys.get("portin"), keys.get("portout"));
+          edges.add(edge);
+        } else if (line.contains("</FlowGraph>") && lastEntityName != null && !lastEntityName.isEmpty()) {
+          // We've reached the end of the graph, but there may be more than one in this file.
           File newXml = new File(xml.getCanonicalPath().replace(".xml", "") + "_" + lastEntityName + ".xml");
+          Graph<FlowGraphNode, FlowGraphEdge> graph = createGraph(nodes, edges);
           writeFile(graph, newXml);
-          graph = new DirectedPseudograph<>(FlowGraphEdge.class);
+          // Reset the tracked nodes and edges
+          nodes = new HashMap<String, FlowGraphNode>();
+          edges = new LinkedList<FlowGraphEdge>();
         }
         line = r.readLine();
       }
     }
-
+    Graph<FlowGraphNode, FlowGraphEdge> graph = createGraph(nodes, edges);
     writeFile(graph, xml);
+  }
+ 
+  /**
+   * Convert dictionary of nodes to a Graph object that can become a dot file.
+   * @param nodes
+   * @return
+   */
+  private static Graph<FlowGraphNode, FlowGraphEdge> createGraph(HashMap<String, FlowGraphNode> nodes, List<FlowGraphEdge> edges) {
+    Graph<FlowGraphNode, FlowGraphEdge> graph = new DirectedPseudograph<>(FlowGraphEdge.class);
+    
+    for (FlowGraphNode n : nodes.values()) {
+      graph.addVertex(n);
+    }
+    
+    for (FlowGraphEdge e : edges) {
+      graph.addEdge(nodes.get(e.nodeOut), nodes.get(e.nodeIn), e);
+    }
+    
+    return graph;
   }
 
   private void writeFile(Graph<FlowGraphNode, FlowGraphEdge> graph, File xml)
@@ -182,7 +252,7 @@ public class ParseFlowGraph {
     ComponentAttributeProvider<FlowGraphNode> nodeAttrProvider = node -> {
       HashMap<String, Attribute> attrs = new HashMap<>();
       attrs.put("pos",
-          DefaultAttribute.createAttribute(String.format("%f, %f, %f", node.getX(), node.getY(), node.getZ())));
+          DefaultAttribute.createAttribute(String.format("%f, %f!", node.getX(), node.getY() * 0.75)));
       return attrs;
     };
 
@@ -207,9 +277,20 @@ public class ParseFlowGraph {
 
     Collections.sort(unhandledClasses);
 
-    unhandledClasses.stream().forEach((s) -> System.out.println(s));
+    System.out.println("Classes that didn't have special parsers:");
+    unhandledClasses.stream().forEach((s) -> {
+      System.out.println(s);
+      return;
+    });
   }
 
+  /**
+   * Tries to intelligently replace the label ID on the node with something more human readable.
+   * @param nodeClass
+   * @param nodeName
+   * @param inputKeys
+   * @return
+   */
   private String getLabel(String nodeClass, String nodeName, HashMap<String, String> inputKeys) {
     String label = nodeClass + " " + inputKeys.toString();
     switch (nodeClass) {
@@ -229,7 +310,7 @@ public class ParseFlowGraph {
         tokenId = inputKeys.get("gametokenid_token");
         value = inputKeys.get("compare_value");
         tokenTranslated = (gameTokenIds.containsKey(tokenId)) ? gameTokenIds.get(tokenId) : tokenId;
-        label = String.format("UPDATED TOKEN %s=\"%s\"", tokenTranslated, value);
+        label = String.format("ON UPDATED TOKEN %s=\"%s\"", tokenTranslated, value);
         break;
       case "Mission:GameTokenGet":
         tokenId = inputKeys.get("gametokenid_token");
@@ -247,7 +328,7 @@ public class ParseFlowGraph {
       case "Ark:GameMetric":
         String metricId = inputKeys.get("gamemetric_metric");
         String metric = gameMetricIds.containsKey(metricId) ? gameMetricIds.get(metricId) : metricId;
-        label = String.format("METRIC \"%s\"", gameMetricIds.get(metric));
+        label = String.format("METRIC \"%s\"", metric);
         break;
       case "Ark:IncrementGameMetric":
         metricId = inputKeys.get("gamemetric_metric");
@@ -378,20 +459,32 @@ public class ParseFlowGraph {
         loc = locationIds.containsKey(locId) ? locationIds.get(locId) : locId;
         label = String.format("SET ROSTER %s \nTO LOCATION %s", "TODO: roster", loc);
         break;
+      case "Ark:PDA:SetStationAccessState":
+        String pathId = inputKeys.get("stationaccess_access");
+        String pathName = connectivity.get(pathId);
+        label = pathName;
+        break;
+      case "Ark:PDA:SetStationAirlockState":
+        String airlockId = inputKeys.get("stationairlock_airlock");
+        String location = locationIds.get(connectivity.get(airlockId));
+        label = String.format("Airlock to %s", location);
+        break;
       default:
         if (!unhandledClasses.contains(nodeClass)) {
           unhandledClasses.add(nodeClass);
         }
         break;
     }
-    if (label.contains("null")) {
+    if (label == null || label.contains("null")) {
       label += "\n" + nodeClass + " " + inputKeys.toString() + "(was null)";
+      System.out.println(nodeClass + " " + inputKeys.toString());
+    }
+    if (label.length() > MAX_LABEL_LENGTH) {
+      label = label.substring(0,  MAX_LABEL_LENGTH);
     }
     return label;
   }
 
-  private static final String GAME_TOKENS_FILE = "Libs\\GameTokens\\GT_Global.xml";
-  private static final String GAME_METRICS_FILE = "Ark\\Player\\GameMetrics.xml";
 
   private HashMap<String, String> getGameMetricIds() {
     HashMap<String, String> gameMetricIds = new HashMap<String, String>();
@@ -433,7 +526,6 @@ public class ParseFlowGraph {
     return gameTokenIds;
   }
 
-  private static final String REMOTE_EVENTS_FILE = "Ark\\RemoteEventLibrary.xml";
 
   private void getRemoteEvents() {
     remoteEvents = new HashMap<String, String>();
@@ -455,7 +547,6 @@ public class ParseFlowGraph {
     }
   }
 
-  private static final String OBJECTIVES_DIR = "Ark\\Campaign\\Objectives";
 
   private void getObjectives() {
     objectives = new HashMap<String, String>();
@@ -468,21 +559,33 @@ public class ParseFlowGraph {
     for (File f : objectivesDir.toFile().listFiles()) {
       try (BufferedReader r = new BufferedReader(new FileReader(f.getCanonicalPath()));) {
         String line = r.readLine();
+        String objectiveId = "";
+        boolean needObjectiveDesc = false;
         while (line != null) {
           String header = getLineHeader(line);
           HashMap<String, String> keys = getKeysFromLine(line);
           switch (header) {
             case "Objective":
-              objectives.put(keys.get("id"), keys.get("displayname"));
+              // Use the next task, description, or clue display name as the objective name
+              needObjectiveDesc = true;
+              objectiveId = keys.get("id");
               break;
             case "Task":
               tasks.put(keys.get("id"), keys.get("displayname"));
+              if (needObjectiveDesc) {
+                objectives.put(objectiveId, keys.get("displayname"));
+                needObjectiveDesc = false;
+              }
               break;
             case "Desc":
               descriptions.put(keys.get("id"), keys.get("displayname"));
               break;
             case "Clue":
               clues.put(keys.get("id"), keys.get("displayname"));
+              if (needObjectiveDesc) {
+                objectives.put(objectiveId, keys.get("displayname"));
+                needObjectiveDesc = false;
+              }
               break;
             default:
               break;
@@ -494,9 +597,7 @@ public class ParseFlowGraph {
       }
     }
   }
-  
-  private static final String LOCATIONS_FILE = "Ark\\Campaign\\Locations.xml";
-  
+
   private void parseLocationIds() {
     locationIds = new HashMap<String, String>();
     Path locationsFile = sourceDir.toPath().resolve(LOCATIONS_FILE);
@@ -516,15 +617,45 @@ public class ParseFlowGraph {
     }
   }
 
-  private void convertDot(File dot, File out) throws IOException, InterruptedException {
-    String execCommand = DOT_EXE + " -Tpng " + dot.getCanonicalPath() + " -o " + out.getCanonicalPath();
-    Process p = Runtime.getRuntime().exec(execCommand);
-    p.waitFor(10, TimeUnit.SECONDS);
+  private void getConnectivity() {
+    connectivity = new HashMap<String, String>();
+    Path connectivityFile = sourceDir.toPath().resolve(CONNECTIVITY_FILE);
+    
+    try (BufferedReader r = new BufferedReader(new FileReader(connectivityFile.toString()));) {
+      String line = r.readLine();
+      while (line != null) {
+        if (line.contains("<ArkStationPath ")) {
+          Map<String, String> keys = getKeysFromLine(line);
+          String id = keys.get("id");
+          String name = keys.get("name");
+          connectivity.put(id, name);
+        } else if (line.contains("<ArkStationAirlock ")) {
+          Map<String, String> keys = getKeysFromLine(line);
+          String id = keys.get("id");
+          String location = keys.get("location");
+          connectivity.put(id, location);
+        }
+        line = r.readLine();
+      }
+    } catch (Exception e) {
+      e.printStackTrace();
+    }
+    
   }
 
-  private static final BigInteger TWO_POWER_64 = BigInteger.ONE.shiftLeft(64);
+  private static void convertDot(File dot, File out) throws IOException, InterruptedException {
+    String execCommand = DOT_EXE + " -Kneato -n -Tjpg " + dot.getCanonicalPath() + " -o " + out.getCanonicalPath();
+    Process p = Runtime.getRuntime().exec(execCommand);    
+    p.waitFor(10, TimeUnit.SECONDS);
+    p.destroy();
+    if (p.exitValue() == 0) {
+      System.out.println("Finished executing dot convert.");
+    } else {
+      System.out.println("Error occurred while executing dot convert.");
+    }
+  }
 
-  private String signedToUnsignedLong(String signedLong) {
+  private static String signedToUnsignedLong(String signedLong) {
     BigInteger b = new BigInteger(signedLong);
     if (b.signum() < 0) {
       b = b.add(TWO_POWER_64);
@@ -532,9 +663,7 @@ public class ParseFlowGraph {
     return b.toString();
   }
 
-  private static final String HEADER_PATTERN = "<([A-Za-z]*?) ";
-
-  private String getLineHeader(String line) {
+  private static String getLineHeader(String line) {
     Pattern p = Pattern.compile(HEADER_PATTERN);
     Matcher m = p.matcher(line);
     if (m.find()) {
@@ -543,9 +672,7 @@ public class ParseFlowGraph {
     return "";
   }
 
-  private static final String KEY_PATTERN = "([A-Za-z_]*?)=\"([A-Za-z0-9&;,-:_/ ]*?)\"";
-
-  private HashMap<String, String> getKeysFromLine(String line) {
+  private static HashMap<String, String> getKeysFromLine(String line) {
     HashMap<String, String> keyPairs = new HashMap<String, String>();
     Pattern p = Pattern.compile(KEY_PATTERN);
 

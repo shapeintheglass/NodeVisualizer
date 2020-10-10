@@ -21,11 +21,11 @@ public class Main {
     outputDir.mkdir();
     ParseFlowGraph pfg = new ParseFlowGraph(preyOutDir.toFile(), outputDir);
     
+    pfg.parse(new File("D:\\PreyFiles\\FILES_PREY\\GameSDK\\Levels\\Campaign\\EndGame\\mission_mission0.xml"));
+    //pfg.parse(new File("D:\\PreyFiles\\FILES_PREY\\Libs\\GlobalActions\\global_dahlultimatums.xml"));
     
-    //pfg.parse(new File("D:\\PreyFiles\\FILES_PREY\\Libs\\GlobalActions\\global_sidequest_withthisring.xml"));
-    
-    for (File f : globalActionsDir.listFiles()) {
-      pfg.parse(f);
-    }
+    //for (File f : globalActionsDir.listFiles()) {
+    //  pfg.parse(f);
+    //}
   }
 }
